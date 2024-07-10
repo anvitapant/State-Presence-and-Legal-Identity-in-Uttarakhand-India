@@ -1,0 +1,924 @@
+---
+title: Multilevel logistic regression on state presence, terrain features, and legal identity
+  possession in Uttarakhand
+output:
+  word_document: default
+  pdf_document: default
+---
+
+## Setup
+
+```{r, setup, include = FALSE}
+# Set working directory for all code chunks
+knitr::opts_knit$set(root.dir = "/Users/anvitapant/Library/CloudStorage/OneDrive-UvA/Thesis/Quant/DHS 2015") 
+# Replace the string with the path to your working directory
+
+# Clean the environment
+rm(list = ls())
+```
+
+
+```{r}
+# Install and load required packages 
+#install.packages("tidyverse")
+#install.packages("readstata13")
+#install.packages("lme4")
+#install.packages("sjPlot")
+#install.packages("modelsummary")
+#install.packages("prediction") 
+#install.packages("margins")
+#install.packages("stargazer")
+library(prediction)
+library(stargazer)
+library(margins)
+library(modelsummary)
+library(tidyverse)
+library(readstata13) 
+library(lme4) 
+library(sjPlot) 
+```
+
+## Preparing a dataframe with relevant variables
+
+```{r}
+vars <- c("shdistri", "hv021", "hv270", "sh34", "sh36", "hv009", "hv024") 
+# Variable names to include 
+
+# Appending the variables for household member characteristics to the list of 
+# variable names
+headers_to_get <- vector()
+header_prefixes = c("hv104_", "hv105_", "hv106_","hvidx_", "hv140_", "sh21a_")
+
+for (prefix in header_prefixes) {
+  for (i in 1:41) {
+    headers_to_get <- append(headers_to_get, sprintf("%s%02d", prefix, i))
+  }
+}
+# Appending the variable for mother's highest educational level to the list of 
+# variable names
+for (i in 1:9) {
+    vars <- append(vars, sprintf("hc61_%d", i))
+  }
+
+vars <- append(vars, headers_to_get)
+vars <- append("hhid", vars)
+
+vars
+```
+
+
+```{r}
+# Input of columns with the specific variable names 
+dhs_15_df <- read.dta13("IAHR74FL.DTA", generate.factors=TRUE, 
+                        missing.type = TRUE, select.cols = vars)
+
+# Write to a .csv file for ease of retrieval
+write.csv(dhs_15_df, file = "varsofinterest.csv") 
+
+# Filtering the dataframe to only retain observations from Uttarakhand 
+UK_df_wide <- dhs_15_df %>% 
+  filter(hv024 == "uttarakhand")
+```
+
+
+
+```{r}
+# Converting data from wide to long format: Information for each HH member is 
+# currently presented in columns. I convert this to present information for 
+# each household member in rows.
+not_all_na <- function(x) any(!is.na(x))
+HH_chars_df <- UK_df_wide %>% 
+  select(where(not_all_na)) %>% 
+  pivot_longer(cols = starts_with(c("hvidx_", "hv104_", "hv105_", "hv106_", 
+                                    "hv140_", "sh21a_")),
+               names_to = c(".value", "hvidx_values", "hv104_values",
+                            "hv105_values", "hv106_values", "hv140_values",
+                            "sh21a_values"),
+               names_sep = "_") 
+  
+```
+
+```{r}
+# Mapping entries in columns hc61_[1-5] to values below age 5 in column 
+# hv105
+fill_hc61_data <- function(df) {
+  children_rows <- df[as.integer(as.character(df[, "hv105"][[1]])) < 5,] %>% 
+    filter( !if_all( c(hvidx), is.na ) ) %>% 
+    select(hvidx) %>% 
+    array
+  
+  children_rows <- children_rows[[1]]
+  newcol = rep(NA, nrow(df))
+  
+  if (is.na(children_rows[1])) {
+    return(newcol)
+  }
+  
+  # This contains all data for any household
+  household_id <- df[1, "hhid"][[1]]
+  household_row <- UK_df_wide[UK_df_wide$hhid == household_id,]
+  
+  for (idx in 1:length(children_rows) ) {
+    rownumber = children_rows[idx]
+    value <- household_row[sprintf("hc61_%d", idx)][[1]]
+    newcol[rownumber] <- as.character(value)
+  }
+  return(newcol)
+}
+```
+
+```{r}
+# Applying the function to the entire dataframe to unnest data
+options(warn = -1)
+HH_bymember_df <- HH_chars_df %>% 
+  group_by(hhid) %>% 
+  do(data.frame(., hc61 = fill_hc61_data(.))) %>% 
+  unnest
+```
+
+```{r}
+# Retaining the relevant column names
+HH_bymember_df <- HH_bymember_df[, !names(HH_bymember_df) %in% 
+                                   append(c("hvidx_values",
+                                            "hv104_values","hv105_values",
+                                            "hv106_values", "hv140_values",
+                                            "sh21a_values", "hc61_1", "hc61_2",
+                                            "hc61_3", "hc61_4", "hc61_5"),
+                                          headers_to_get)] 
+
+# Renaming columns in the new dataframe
+oldcolnames <- c(names(HH_bymember_df))
+newcolnames <- c("case_id", "num_HH_members", "psu", "state", "wealth_idx", 
+                 "district", "HH_head_religion", "HH_head_caste", 
+                 "HH_member_idx", "sex", "age", "edu_lvl", "birth_cert", 
+                 "has_aadhaar", "mother_edu_lvl")
+HH_bymember_df_renamedcols <- HH_bymember_df %>% 
+  select(all_of(oldcolnames)) %>%
+  rename_with(~ newcolnames[which(oldcolnames == .x)])
+HH_bymember_df_renamedcols
+```
+
+```{r}
+# Write to a .csv file for ease of retrieval
+write_csv(HH_bymember_df_renamedcols, "tidied_data.csv") 
+```
+
+```{r}
+# Get summary statistics of our tidied data
+summary(HH_bymember_df_renamedcols)
+```
+
+## Handling missing data
+
+```{r}
+# Count missing values in each column of the overall dataframe
+sapply(HH_bymember_df_renamedcols, function(x) sum(is.na(x)))
+
+# Overall missing value count in our dataframe
+sum(is.na(HH_bymember_df_renamedcols))
+```
+
+```{r}
+# Checking for unique values in the age column of the overall dataframe
+unique(HH_bymember_df_renamedcols$age)
+```
+
+```{r}
+# Replacing the values for "95+" and "don't know" in the age column
+replaced_age_vals <- HH_bymember_df_renamedcols$age %>% 
+  gsub("95\\+", 100, .) %>% 
+  gsub("don't know", NA, .)
+
+HH_bymember_df_renamedcols$age <- replaced_age_vals
+```
+
+```{r}
+# Filter the overall dataframe for characteristics of children under 
+# 5 years of age
+HH_children_df <- HH_bymember_df_renamedcols %>% 
+  filter(as.integer(as.character(age)) < 5)
+HH_children_df
+```
+
+```{r}
+# Count missing values in each column of the dataframe with values for 
+# children under 5
+sapply(HH_children_df, function(x) sum(is.na(x)))
+
+# Overall missing value count in the dataframe with values for children under 5
+sum(is.na(HH_children_df))
+```
+
+```{r}
+# Filter the overall dataframe for characteristics of anyone at or above
+# 5 years of age
+HH_othermems_df <- HH_bymember_df_renamedcols %>% 
+  filter(as.integer(as.character(age)) >= 5 | is.na(age) | age == 100)
+```
+
+
+```{r}
+# Retaining the relevant column names of the dataframe with values for anyone 
+# at or above 5 years of age
+droppedcols <- c("birth_cert", "mother_edu_lvl")
+HH_othermems_df <- HH_othermems_df[, !names(HH_othermems_df) %in% droppedcols] 
+HH_othermems_df
+```
+
+```{r}
+# Count missing values in each column of the dataframe with values for anyone at
+# or above 5 years of age
+sapply(HH_othermems_df, function(x) sum(is.na(x)))
+
+# Overall missing value count in the dataframe with values for anyone at or above 
+# 5 years of age
+sum(is.na(HH_othermems_df))
+```
+
+```{r}
+# Number of rows in dataframe with values for children under 5 before dropping
+# missing observations
+nrow(HH_children_df)
+
+# Number of rows in dataframe with values for anyone at or above 5 years of age 
+# before dropping missing observations
+nrow(HH_othermems_df)
+```
+
+```{r}
+# Exclude rows having missing data from dataframe with values for children 
+# under 5 for ANY variable
+HH_children_df_no_NA1 <- HH_children_df %>% 
+  drop_na()
+HH_children_df_no_NA <- HH_children_df_no_NA1 %>%
+  filter(mother_edu_lvl != "don't know")
+
+# Number of rows in dataframe with values for for children under 5 after 
+# dropping missing observations
+nrow(HH_children_df_no_NA)
+
+# Write to a .csv file
+write.csv(HH_children_df_no_NA, "HH_children_data_tidied_final.csv")
+```
+
+```{r}
+# Exclude rows having missing data from dataframe with values for anyone at or 
+# above 5 years of age for ANY variable
+HH_othermems_df_no_NA <- HH_othermems_df %>% 
+  drop_na()
+
+
+# Number of rows in dataframe with values for anyone at or above 5 years of age 
+# after dropping missing observations
+nrow(HH_othermems_df_no_NA)
+
+# Write to a .csv file
+write.csv(HH_othermems_df_no_NA, "HH_othermembers_data_tidied_final.csv")
+```
+
+
+```{r}
+# Now I load the variables for the spatial characteristics, keep values for 
+# Uttarakhand districts for 2015, and save them as .csv files for easy retrieval
+setwd("/Users/anvitapant/Library/CloudStorage/OneDrive-UvA/Thesis/Quant/SHRUG/shrug-forest cover-csv")
+forest_cover <- read.csv("vcf_pc11dist.csv")
+vars<-c("pc11_district_id","pc11_state_id","vcf_mean","year")
+forest_cover_df <- forest_cover[,vars]
+forest_cover_df$pc11_district_id <- as.numeric(forest_cover_df$pc11_district_id)
+forest_cover_df <- forest_cover_df[forest_cover_df$pc11_district_id>055,]
+forest_cover_df <- forest_cover_df[forest_cover_df$pc11_district_id<069,] 
+forest_cover_df <- forest_cover_df[forest_cover_df$year>2014,]
+forest_cover_df <- forest_cover_df[forest_cover_df$year<2016,]
+write.csv(forest_cover_df, "forest_cover_UK_districts.csv")
+
+
+setwd("/Users/anvitapant/Library/CloudStorage/OneDrive-UvA/Thesis/Quant/SHRUG/shrug-rugged-csv")
+ruggedness <- read.csv("tri_pc11dist.csv")
+vars<-c("pc11_district_id","pc11_state_id","tri_mean")
+ruggedness_df <- ruggedness[,vars]
+ruggedness_df$pc11_district_id <- as.numeric(ruggedness_df$pc11_district_id)
+ruggedness_df <- ruggedness_df[ruggedness_df$pc11_district_id>055,]
+ruggedness_df <- ruggedness_df[ruggedness_df$pc11_district_id<069,] 
+write.csv(ruggedness_df, "ruggedness_UK districts.csv")
+
+
+setwd("/Users/anvitapant/Library/CloudStorage/OneDrive-UvA/Thesis/Quant/SHRUG/shrug-night lights-annual-csv")
+night_lights <- read.csv("viirs_annual_pc11dist.csv")
+vars <- c("pc11_district_id",	"pc11_state_id", "viirs_annual_mean", "category", "year")
+night_lights_df <- night_lights[,vars]
+night_lights_df$pc11_district_id <- as.numeric(night_lights_df$pc11_district_id)
+night_lights_df$category <- as.character(night_lights_df$category)
+night_lights_df <- night_lights_df[night_lights_df$category != "median-masked",]
+night_lights_df <- night_lights_df[night_lights_df$pc11_district_id>055,]
+night_lights_df <- night_lights_df[night_lights_df$pc11_district_id<069,] 
+night_lights_df <- night_lights_df[night_lights_df$year>2014,]
+night_lights_df <- night_lights_df[night_lights_df$year<2016,]
+write.csv(night_lights_df, "night_lights_UK_districts.csv")
+```
+
+```{r}
+# Merge the 3 data tables with the spatial characteristics into one dataframe
+spatial_dfs_list <- list(forest_cover_df, night_lights_df, ruggedness_df)
+spatial_df <- spatial_dfs_list %>% 
+  reduce(left_join, by = "pc11_district_id")
+```
+
+```{r}
+# Recode the values of the district variable for the spatial variables dataframe
+spatial_df <- spatial_df %>% 
+rename(district = pc11_district_id)
+spatial_df[[1]] <- case_match(
+      spatial_df[[1]],
+      56 ~ "uttarkashi",
+      57 ~ "chamoli",
+      58 ~ "rudraprayag",
+      59 ~ "tehri garhwal",
+      60 ~ "dehradun",
+      61 ~ "garhwal",
+      62 ~ "pithoragarh",
+      63 ~ "bageshwar",
+      64 ~ "almora",
+      65 ~ "champawat",
+      66 ~ "nainital",
+      67 ~ "udham singh nagar",
+      68 ~ "hardwar"
+    )
+spatial_df
+```
+
+Do a left-join of the dataframes to combine spatial, district level variables 
+with individual characteristics in each row
+
+```{r}
+HH_children_left_merged_df <- merge(HH_children_df_no_NA,
+                                    spatial_df,
+                                    by = "district",
+                                    all.x = TRUE)
+
+head(HH_children_left_merged_df[c("case_id", "viirs_annual_mean", "vcf_mean", 
+                                  "tri_mean")])
+```
+
+```{r}
+# Do a left-join of the dataframes with variables for household members of ages 
+# 5 and above and spatial characteristics
+HH_othermems_left_merged_df <- merge(HH_othermems_df_no_NA,
+                                    spatial_df,
+                                    by = "district",
+                                    all.x = TRUE)
+```
+
+## Dummy coding a few categorical variables in preparation for regression
+
+```{r}
+# Drop unused factor levels from the dataframe
+HH_children_left_merged_df <- droplevels(HH_children_left_merged_df)
+HH_othermems_left_merged_df <- droplevels(HH_othermems_left_merged_df)
+
+```
+
+### For children under 5 years of age
+
+```{r}
+# Creating dummy variables for the household head's religion
+HH_children_left_merged_df <- HH_children_left_merged_df %>%
+  mutate(HH_head_religion_hindu = ifelse(HH_head_religion == "hindu", 1, 0),
+         HH_head_religion_muslim = ifelse(HH_head_religion == "muslim", 1, 0),
+         HH_head_religion_sikh = ifelse(HH_head_religion == "sikh", 1, 0),
+         HH_head_religion_others = case_when(
+           HH_head_religion %in% c("christian", "buddhist/neo-buddhist", "parsi/zoroastrian", "other") ~ 1,
+           TRUE ~ 0))
+
+```
+
+```{r}
+# Creating a dummy variable for birth certificate possession 
+HH_children_left_merged_df$birth_cert_recoded <-
+  HH_children_left_merged_df$birth_cert
+HH_children_left_merged_df$birth_cert_recoded <- case_match(
+  HH_children_left_merged_df$birth_cert_recoded,
+  "has certificate" ~ 1,
+  c("neither certificate or registered", "registered", "don't know") ~ 0
+)
+```
+
+```{r}
+# Selecting reference factor categorical variables for regressions
+HH_children_left_merged_df$district <- relevel(HH_children_left_merged_df$district, "dehradun")
+HH_children_left_merged_df$HH_head_caste <- relevel(HH_children_left_merged_df$HH_head_caste, "none of above")
+HH_children_left_merged_df$sex <- relevel(HH_children_left_merged_df$sex, "male")
+HH_children_left_merged_df$wealth_idx <- relevel(HH_children_left_merged_df$wealth_idx, "poorest")
+# Changing the mother's education level variable into a factor
+HH_children_left_merged_df$mother_edu_lvl <- as.factor(HH_children_left_merged_df$mother_edu_lvl)
+HH_children_left_merged_df$mother_edu_lvl <- relevel(HH_children_left_merged_df$mother_edu_lvl, "no education")
+
+```
+
+###  For household members of ages 5 and above
+
+```{r}
+# Creating dummy variables for the household head's religion
+HH_othermems_left_merged_df <- HH_othermems_left_merged_df %>%
+  mutate(HH_head_religion_hindu_othermems = ifelse(HH_head_religion == "hindu", 1, 0),
+         HH_head_religion_muslim_othermems = ifelse(HH_head_religion == "muslim", 1, 0),
+         HH_head_religion_sikh_othermems = ifelse(HH_head_religion == "sikh", 1, 0),
+         HH_head_religion_others_othermems = case_when(
+           HH_head_religion %in% c("christian", "buddhist/neo-buddhist", "parsi/zoroastrian", "other") ~ 1,
+           TRUE ~ 0))
+```
+
+```{r}
+# Creating a dummy variable for Aadhaar card possession
+HH_othermems_left_merged_df$has_aadhaar_recoded <-
+  HH_othermems_left_merged_df$has_aadhaar
+HH_othermems_left_merged_df$has_aadhaar_recoded <- case_match(HH_othermems_left_merged_df$has_aadhaar_recoded,
+                                                     "yes" ~ 1,
+                                                     c("no", "don't know") ~ 0)
+```
+
+```{r}
+# Selecting reference factor categorical variables for regressions
+HH_othermems_left_merged_df$district <- relevel(HH_othermems_left_merged_df$district, "dehradun")
+HH_othermems_left_merged_df$HH_head_caste <- relevel(HH_othermems_left_merged_df$HH_head_caste, "none of above")
+HH_othermems_left_merged_df$sex <- relevel(HH_othermems_left_merged_df$sex, "male")
+HH_othermems_left_merged_df$wealth_idx <- relevel(HH_othermems_left_merged_df$wealth_idx, "poorest")
+# Changing the education level variable into a factor
+HH_othermems_left_merged_df$edu_lvl <- as.factor(HH_othermems_left_merged_df$edu_lvl)
+HH_othermems_left_merged_df$edu_lvl <- relevel(HH_othermems_left_merged_df$edu_lvl,
+                                               "no education, preschool")
+
+```
+
+## Rate of possession of BC and Aadhaar
+```{r}
+# Calculating district possession rates for birth certificate
+possession_rates1 <- HH_children_left_merged_df %>%
+  group_by(district) %>%
+ summarize(
+    total_population = n(),
+    possession_count = sum(birth_cert_recoded),
+    possession_rate = mean(birth_cert_recoded) * 100
+  )
+
+possession_rates_df1 <- as.data.frame(possession_rates1)
+possession_rates_df1$non_possession <- possession_rates_df1$total_population - possession_rates_df1$possession_count
+
+contingency_table1 <- data.frame(
+  possession1 = possession_rates_df1$possession_count,
+  non_possession = possession_rates_df1$non_possession,
+  row.names = possession_rates_df1$district
+)
+
+print(contingency_table1)
+
+chi_squared_result1 <- chisq.test(contingency_table1)
+
+# View the results
+print(chi_squared_result1)
+
+write.csv(possession_rates1, "possession_rates1.csv", row.names = FALSE)
+
+
+# Calculating district possession rates for Aadhaar 
+possession_rates <- HH_othermems_left_merged_df %>%
+  group_by(district) %>%
+ summarize(
+    total_population = n(),
+    possession_count = sum(has_aadhaar_recoded),
+    possession_rate = mean(has_aadhaar_recoded) * 100
+  )
+
+possession_rates_df <- as.data.frame(possession_rates)
+possession_rates_df$non_possession <- possession_rates_df$total_population - possession_rates_df$possession_count
+
+contingency_table <- data.frame(
+  possession = possession_rates_df$possession_count,
+  non_possession = possession_rates_df$non_possession,
+  row.names = possession_rates_df$district
+)
+
+print(contingency_table)
+
+chi_squared_result <- chisq.test(contingency_table)
+
+# View the results
+print(chi_squared_result)
+
+write.csv(possession_rates, "possession_rates.csv", row.names = FALSE)
+```
+
+## Regression analyses
+
+### Preliminary phase
+
+```{r}
+# Grand-mean centering the level 2 variables
+
+# Forest cover
+HH_children_left_merged_df$vcf_mean <- HH_children_left_merged_df$vcf_mean - mean(HH_children_left_merged_df$vcf_mean)
+HH_othermems_left_merged_df$vcf_mean <- HH_othermems_left_merged_df$vcf_mean - mean(HH_othermems_left_merged_df$vcf_mean)
+
+# Ruggedness
+HH_children_left_merged_df$tri_mean <- HH_children_left_merged_df$tri_mean - mean(HH_children_left_merged_df$tri_mean)
+HH_othermems_left_merged_df$tri_mean <- HH_othermems_left_merged_df$tri_mean - mean(HH_othermems_left_merged_df$tri_mean)
+
+# Night lights
+HH_children_left_merged_df$viirs_annual_mean <- HH_children_left_merged_df$viirs_annual_mean - mean(HH_children_left_merged_df$viirs_annual_mean)
+HH_othermems_left_merged_df$viirs_annual_mean <- HH_othermems_left_merged_df$viirs_annual_mean - mean(HH_othermems_left_merged_df$viirs_annual_mean)
+
+
+```
+
+### Simple logit model with all variables on the same level
+
+#### Birth certificate possession
+
+```{r}
+# Running a simple regression with all level 1 and level 2 variables at the 
+# same level
+
+M1_birth_cert <- glm(
+  birth_cert_recoded ~ sex + wealth_idx + mother_edu_lvl
+  + HH_head_religion_muslim + HH_head_religion_sikh + HH_head_religion_others 
+  + HH_head_caste +  viirs_annual_mean + tri_mean + vcf_mean,
+  data = HH_children_left_merged_df,
+  family = binomial(link = "logit")
+)
+summary(M1_birth_cert)
+tab_model(M1_birth_cert)
+M1_birth_cert_margins <- margins(M1_birth_cert)
+M1_birth_cert_summary <- summary(M1_birth_cert_margins)
+write.csv(M1_birth_cert_summary, "M1_birth_cert_summary.csv")
+tab_model(M1_birth_cert)
+
+```
+
+```{r}
+# Running a simple regression with all level 1 and level 2 variables at 
+# the same level
+M1_aadhaar <- glm(
+  has_aadhaar_recoded ~ sex + wealth_idx + edu_lvl
+   + HH_head_religion_muslim_othermems + HH_head_religion_sikh_othermems
+  + HH_head_religion_others_othermems  
+  + HH_head_caste + viirs_annual_mean + tri_mean + vcf_mean,
+  data = HH_othermems_left_merged_df,
+  family = binomial(link = "logit")
+)
+summary(M1_aadhaar)
+tab_model(M1_aadhaar)
+M1_aadhaar_margins <- margins(M1_aadhaar)
+M1_aadhaar_margins_summary <- summary(M1_aadhaar_margins)
+write.csv(M1_aadhaar_margins_summary, "M1_aadhaar_margins_summary.csv")
+
+```
+ 
+### Multilevel models
+
+First, I created empty models to ascertain how much variance can be explained 
+by individual and district level factors.
+
+#### Birth certificate possession
+
+```{r}
+#The null model, with a random intercept was created and tested, in 
+#order to calculate the variance at unit and cluster levels
+ M0 <- glmer(birth_cert_recoded ~ 1 - (1 | district),
+  data = HH_children_left_merged_df,
+  family = binomial(link = "logit"),
+  glmerControl(calc.derivs = FALSE) # We use this so that the model converges
+)
+summary(M0)
+tab_model(M0, file = "M0_birth_cert.doc")
+
+M0_level2 <- glmer (birth_cert_recoded ~ sex + wealth_idx + mother_edu_lvl + HH_head_religion_muslim 
+   + HH_head_religion_sikh + HH_head_religion_others
+  + HH_head_caste + (1|district),
+  data =  HH_children_left_merged_df, 
+  family = binomial(link = "logit"),
+  glmerControl(calc.derivs = FALSE)
+)
+
+summary(M0_level2)
+tab_model(M0_level2, file = "M0_level2_birth_cert.doc")
+```
+
+
+```{r}
+# Plotting estimates of level 2 residuals obtained from the empty model
+u0 <- ranef(M0, condVar = TRUE)
+u0se <- sqrt(attr(u0[[1]], "postVar")[1, , ])
+district_id <- rownames(u0[[1]])
+u0tab <- cbind("district_id" = district_id,
+               "u0" = u0[[1]],
+               "u0se" = u0se)
+colnames(u0tab)[2] <- "u0"
+u0tab <- u0tab[order(u0tab$u0), ]
+u0tab <- cbind(u0tab, c(1:dim(u0tab)[1]))
+u0tab <- u0tab[order(u0tab$district_id), ]
+colnames(u0tab)[4] <- "u0rank"
+plot(
+  u0tab$u0rank,
+  u0tab$u0,
+  type = "n",
+  xlab = "District ID (j)",
+  ylab = "Random District Level Intercept (u0j)",
+  ylim = c(-4, 4)
+)
+segments(u0tab$u0rank,
+         u0tab$u0 - 1.96 * u0tab$u0se,
+         u0tab$u0rank,
+         u0tab$u0 +
+           1.96 * u0tab$u0se) + abline(h = 0, col = "red")
+points(u0tab$u0rank, u0tab$u0, col = "blue")
+```
+
+**Intraclass correlation coefficient**
+
+```{r}
+# Calculating the intraclass correlation coefficient for birth certificate possession
+icc_birth_cert <- M0@theta[1]^2/ (M0@theta[1]^2 + (pi^2/3))
+icc_birth_cert
+# icc is 0.03 --> 3% variance at districts
+```
+
+#### Aadhaar possession
+
+```{r}
+M_1_0 <- glmer(
+  has_aadhaar_recoded ~ 1 - (1 | district),
+  data = HH_othermems_left_merged_df,
+  family = binomial(link = "logit"),
+  glmerControl(calc.derivs = FALSE) # We use this so that the model converges
+)
+summary(M_1_0)
+tab_model(M_1_0, file = "M0_aadhaar.doc")
+
+M_1_0_level2 <- glmer (has_aadhaar_recoded ~ sex + wealth_idx + edu_lvl
+   + HH_head_religion_muslim_othermems 
+ + HH_head_religion_sikh_othermems   + HH_head_religion_others_othermems
+  + HH_head_caste + (1|district),
+  data =  HH_othermems_left_merged_df, 
+  family = binomial(link = "logit"),
+  glmerControl(calc.derivs = FALSE)
+)
+
+summary(M_1_0_level2)
+tab_model(M_1_0_level2, file = "M0_level2_birth_cert.doc")
+```
+
+
+```{r}
+# Plotting estimates of level 2 residuals obtained from the null model
+u0_1 <- ranef(M_1_0, condVar = TRUE)
+u0se_1 <- sqrt(attr(u0_1[[1]], "postVar")[1, , ])
+district_id1 <- rownames(u0_1[[1]])
+u0_1tab <- cbind("district_id1" = district_id1,
+                 "u0_1" = u0_1[[1]],
+                 "u0se_1" = u0se_1)
+colnames(u0_1tab)[2] <- "u0_1"
+u0_1tab <- u0_1tab[order(u0_1tab$u0_1), ]
+u0_1tab <- cbind(u0_1tab, c(1:dim(u0_1tab)[1]))
+u0_1tab <- u0_1tab[order(u0_1tab$district_id1), ]
+colnames(u0_1tab)[4] <- "u0rank_1"
+plot(
+  u0_1tab$u0rank_1,
+  u0_1tab$u0_1,
+  type = "n",
+  xlab = "District ID (j)",
+  ylab = "Random District Level Intercept (u0j)",
+  ylim = c(-4, 4)
+)
+segments(
+  u0_1tab$u0rank_1,
+  u0_1tab$u0_1 - 1.96 * u0_1tab$u0se_1,
+  u0_1tab$u0rank_1,
+  u0_1tab$u0_1 +
+    1.96 * u0_1tab$u0se_1
+) + abline(h = 0, col = "red")
+points(u0_1tab$u0rank_1, u0_1tab$u0_1, col = "blue")
+```
+
+**Intraclass correlation coefficient**
+
+```{r}
+# Calculating the intraclass correlation coefficient for Aadhaar possession
+icc_aadhaar <- M_1_0@theta[1]^2/ (M_1_0@theta[1]^2 + (pi^2/3))
+icc_aadhaar
+#0.2159622 --> 21.7% at districts
+```
+
+
+### Fixed effects model
+
+These models have individual level effects and fixed effects for districts
+
+#### Birth certificate possession
+
+```{r}
+# Fixed effects model with only control variables
+M2_fixedeff <- glm(
+  birth_cert_recoded ~ sex + wealth_idx + mother_edu_lvl + HH_head_religion_muslim 
+   + HH_head_religion_sikh + HH_head_religion_others
+  + HH_head_caste + (district),
+  data = HH_children_left_merged_df,
+  family = binomial(link = "logit")
+)
+summary(M2_fixedeff)
+tab_model(M2_fixedeff)
+M2_birth_cert_margins <- margins(M2_fixedeff)
+M2_birth_cert_margins_summary <- summary(M2_birth_cert_margins)
+write.csv(M2_birth_cert_margins_summary, "M2_birth_cert_margins_summary.csv")
+
+```
+
+#### Aadhaar possession
+
+```{r}
+# Fixed effects model with only control variables
+M2_1_fixedeff <- glm(
+  has_aadhaar_recoded ~ sex + wealth_idx + edu_lvl
+   + HH_head_religion_muslim_othermems
+  + HH_head_religion_sikh_othermems  + HH_head_religion_others_othermems
+  + HH_head_caste + (district),
+  data = HH_othermems_left_merged_df,
+  family = binomial(link = "logit")
+)
+summary(M2_1_fixedeff)
+tab_model(M2_1_fixedeff)
+M2_aadhaar_margins <- margins(M2_1_fixedeff)
+M2_aadhaar_margins_summary <- summary(M2_aadhaar_margins)
+write.csv(M2_aadhaar_margins_summary, "M2_aadhaar_margins_summary.csv")
+```
+
+### Random slopes models
+
+Finally, I run random slopes models with all individual and district level 
+variables, and include random slopes for each district level variables in a new 
+equation.
+
+#### Birth certificate possession
+
+Model for **night lights**
+
+```{r}
+# Adding the all the level 2 independent variables to the control variable model
+# equation and including the variable for night lights as the random slope
+M3_night_lights <- glmer(
+  birth_cert_recoded ~ sex + wealth_idx + mother_edu_lvl + HH_head_religion_muslim  
+  + HH_head_religion_sikh + HH_head_religion_others + HH_head_caste 
+  + viirs_annual_mean + tri_mean + vcf_mean + (1 + viirs_annual_mean | district),
+  data = HH_children_left_merged_df,
+  family = binomial(link = "logit"),
+  glmerControl(calc.derivs = FALSE),
+  nAGQ = 1
+)
+summary(M3_night_lights)
+M3_night_lights_birth_cert_margins <- margins(M3_night_lights)
+M3_night_lights_birth_cert_margins_summary <- summary(M3_night_lights_birth_cert_margins)
+write.csv(M3_night_lights_birth_cert_margins_summary, "M3_night_lights_birth_cert_margins_summary.csv")
+tab_model(M3_night_lights)
+```
+
+```{r}
+# Model likelihood ratio test in comparison to the empty model
+anova(M3_night_lights, M0, test = "Chi")
+```
+
+Now, we have ruggedness of terrain as the random slope.
+
+```{r}
+# Adding the all the level 2 independent variables to the control variable model 
+# equation and including the variable for ruggedness as the random slope
+M3_ruggedness <- glmer(
+  birth_cert_recoded ~ sex + wealth_idx + mother_edu_lvl
+   + HH_head_religion_muslim + HH_head_religion_sikh + HH_head_religion_others
+  + HH_head_caste + viirs_annual_mean + 
+    tri_mean + vcf_mean + (1 + tri_mean | district),
+  data = HH_children_left_merged_df,
+  family = binomial(link = "logit"),
+  glmerControl(calc.derivs = FALSE),
+  nAGQ = 1
+)
+summary(M3_ruggedness)
+M3_ruggedness_birth_cert_margins <- margins(M3_ruggedness)
+M3_ruggedness_birth_cert_margins_summary <- summary(M3_ruggedness_birth_cert_margins)
+write.csv(M3_ruggedness_birth_cert_margins_summary, "M3_ruggedness_birth_cert_margins_summary.csv")
+tab_model(M3_ruggedness)
+```
+
+```{r}
+# Model likelihood ratio test in comparison to the the empty model
+anova(M3_ruggedness, M0, test = "Chi")
+```
+
+And forest cover.
+
+```{r}
+# Adding the all the level 2 independent variables to the control variable model 
+# equation and including the variable for forest cover as the random slope
+M3_forest_cover <- glmer(
+  birth_cert_recoded ~ sex + wealth_idx + mother_edu_lvl
+ + HH_head_religion_muslim + HH_head_religion_sikh + HH_head_religion_others
+ + HH_head_caste + viirs_annual_mean + 
+    tri_mean + vcf_mean + (1 + vcf_mean | district),
+  data = HH_children_left_merged_df,
+  family = binomial(link = "logit"),
+  glmerControl(calc.derivs = FALSE),
+  nAGQ = 1
+)
+summary(M3_forest_cover)
+M3_forest_cover_birth_cert_margins <- margins(M3_forest_cover)
+M3_forest_cover_birth_cert_margins_summary <- summary(M3_forest_cover_birth_cert_margins)
+write.csv(M3_forest_cover_birth_cert_margins_summary, "1M3_forest_cover_birth_cert_margins_summary.csv")
+tab_model(M3_forest_cover)
+```
+
+```{r}
+# Model likelihood ratio test in comparison to the empty model
+anova(M3_forest_cover, M0, test = "Chi")
+```
+
+#### Aadhaar possession
+
+Same comparisons as above, but now the outcome variable is is Aadhaar possession.
+
+```{r}
+# Adding the all the level 2 independent variables to the control variable model 
+# equation and including the variable for night lights as the random slope
+M3_1_night_lights <- glmer(
+  has_aadhaar_recoded ~ sex + wealth_idx + edu_lvl
+   + HH_head_religion_muslim_othermems 
+ + HH_head_religion_sikh_othermems   + HH_head_religion_others_othermems
+  + HH_head_caste + viirs_annual_mean + tri_mean 
+  + vcf_mean + (1 + viirs_annual_mean | district),
+  data = HH_othermems_left_merged_df,
+  family = binomial(link = "logit"),
+  glmerControl(calc.derivs = FALSE),
+  nAGQ = 1
+)
+summary(M3_1_night_lights)
+tab_model(M3_1_night_lights)
+M3_night_lights_aadhaar_margins <- margins(M3_1_night_lights)
+M3_night_lights_aadhaar_margins_summary <- summary(M3_night_lights_aadhaar_margins)
+write.csv(M3_night_lights_aadhaar_margins_summary, "M3_night_lights_aadhaar_margins_summary.csv")
+```
+
+```{r}
+# Model likelihood ratio test in comparison to the empty model
+anova(M3_1_night_lights, M_1_0, test = "Chi")
+
+```
+
+```{r}
+# Adding the all the level 2 independent variables to the control variable model 
+# equation and including the variable for ruggedness as the random slope
+M3_1_ruggedness <- glmer(
+  has_aadhaar_recoded ~ sex + wealth_idx + edu_lvl
+  + HH_head_religion_muslim_othermems  + HH_head_religion_sikh_othermems 
+  + HH_head_religion_others_othermems
+  + HH_head_caste + viirs_annual_mean + tri_mean + vcf_mean 
+  + (1 + tri_mean | district),
+  data = HH_othermems_left_merged_df,
+  family = binomial(link = "logit"),
+  glmerControl(calc.derivs = FALSE),
+  nAGQ = 1
+)
+summary(M3_1_ruggedness)
+tab_model(M3_1_ruggedness)
+M3_ruggedness_aadhaar_margins <- margins(M3_1_ruggedness)
+M3_ruggedness_aadhaar_margins_summary <- summary(M3_ruggedness_aadhaar_margins)
+write.csv(M3_ruggedness_aadhaar_margins_summary, "M3_ruggedness_aadhaar_margins_summary.csv")
+```
+
+```{r}
+# Model likelihood ratio test in comparison to the empty model
+anova(M3_1_ruggedness, M_1_0, test = "Chi")
+```
+
+```{r}
+# Adding the all the level 2 independent variables to the control variable model 
+# equation and including the variable for forest cover as the random slope
+M3_1_forest_cover <- glmer(
+  has_aadhaar_recoded ~ sex + wealth_idx + edu_lvl
+  + HH_head_religion_muslim_othermems  + HH_head_religion_sikh_othermems 
+  + HH_head_religion_others_othermems
+  + HH_head_caste + viirs_annual_mean + tri_mean 
+  + vcf_mean + (1 + vcf_mean | district),
+  data = HH_othermems_left_merged_df,
+  family = binomial(link = "logit"),
+  glmerControl(calc.derivs = FALSE),
+  nAGQ = 1
+)
+summary(M3_1_forest_cover)
+tab_model(M3_1_forest_cover)
+M3_forest_cover_aadhaar_margins <- margins(M3_1_forest_cover)
+M3_forest_cover_aadhaar_margins_summary <- summary(M3_forest_cover_aadhaar_margins)
+write.csv(M3_forest_cover_aadhaar_margins_summary, "1M3_forest_cover_aadhaar_margins_summary.csv")
+```
+
+```{r}
+# Model likelihood ratio test in comparison to the empty model
+anova(M3_1_forest_cover, M_1_0, test = "Chi")
+```
+
+All done!
